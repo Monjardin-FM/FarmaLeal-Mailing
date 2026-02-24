@@ -1,0 +1,10 @@
+===== LOG DE ENVÍO =====
+Fecha: 2026-02-24 13:53:22
+Total destinatarios: 2
+
+[OK] rmonjardin@salud-interactiva.com.mx
+[OK] robertomonjardin95@gmail.com
+
+===== RESUMEN =====
+Enviados correctamente: 2
+No enviados: 0
