@@ -12,8 +12,10 @@ from openpyxl import load_workbook
 from urllib.parse import unquote, urlparse
 import mimetypes
 import os
+import queue
 import re
 import sys
+import threading
 import time
 
 import boto3
@@ -24,6 +26,7 @@ import boto3
 
 BLOQUE_TAMANO = 50
 ESPERA_ENTRE_BLOQUES = 60  # segundos
+SES_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
 
 BENEFICIOS = [
     "1 TRASLADO EN AMBULANCIA GRATUITO AL AÑO EN CASO DE URGENCIA REAL",
@@ -42,7 +45,7 @@ BENEFICIOS = [
     "SEGURO DE ACCIDENTES PERSONALES. MUERTE ACCIDENTAL $200,000 APLICA DE 12 A 70 AÑOS PERDIDA DE MIEMBROS POR ACCIDENTE ESCALA B $30,000 REEMBOLSO DE GASTOS FUNERARIOS POR ACCIDENTE $30,000 REEMBOLSO DE GASTOS MEDICOS POR ACCIDENTE $20,000 APLICAN DE 0 A 70 AÑOS. COBERTURAS A NIVEL NACIONAL. LAS MEMBRESIAS NO SON ACUMULABLES. POLIZA DE SEGURO 2510030074730",
     "PLATAFORMA CON EXPEDIENTE CLINICO ELECTRÓNICO.",
     "1 CHECK UP GRATIS PARA TITULAR. INCLUYE QS6, BIOMETRIA HEMATICA, EXAMEN GENERAL DE ORINA, INTERPRETACION DE RESULTADOS POR NUESTRO CESDI.",
-    "1. CONSULTA PRESENCIAL O VIDEOCONSULTA CON MEDICINA GENERAL, NUTRICION, PSICOLOGIA, COORDINAR Y AGENDAR A TRAVES DE NUESTRO CONCIERGE. CONSULTA CON MEDICOS DE LA RED A PRECIO TABULADO.",
+    "1 CONSULTA PRESENCIAL O VIDEOCONSULTA CON MEDICINA GENERAL, NUTRICION, PSICOLOGIA, COORDINAR Y AGENDAR A TRAVES DE NUESTRO CONCIERGE. CONSULTA CON MEDICOS DE LA RED A PRECIO TABULADO.",
     "2 VIDEOCONSULTAS DE PEDIATRIA O GINECOLOGIA O MEDICINA INTERNA",
     "3 CUPONES 2 X 1 PARA CINE, SOLICITAR EL BENEFICIO DEBERA COMUNICARSE A CONCIERGE, SE VERIFICARA QUE EL USUARIO SE ENCUENTRE ACTIVO AL MOMENTO DE LA SOLICITUD Y DE SER EL CASO, SE PROPORCIONARA UN CODIGO 2X1. CONSULTA RESTRICCIONES.",
     "1 VIDEOCONSULTA O CONSULTA PRESENCIAL DE ESPECIALIDAD DENTRO DE NUESTRA RED MEDICA SIN COSTO. PARA UTILIZAR ESTE BENEFICIO, ES INDISPENSABLE COORDINAR Y AGENDAR LA CITA A TRAVES DE NUESTRO CONCIERGE MEDICO.",
@@ -55,7 +58,20 @@ BENEFICIOS = [
 # ========================
 
 ruta_excel = ""
-ruta_html = ""
+rutas_pdf = []
+ruta_imagen_1 = ""
+ruta_imagen_2 = ""
+ruta_imagen_3 = ""
+cola_envio = queue.Queue()
+envio_en_proceso = False
+
+TEXTO_CORREO = (
+    "Hola 👋\n\n"
+    "Nos emociona darte la bienvenida a tu plataforma de reembolso.\n"
+    "Aquí podrás consultar tus beneficios, iniciar tus solicitudes y dar seguimiento a cada paso de forma clara, rápida y segura.\n\n"
+    "✨ Descubre cómo funciona y comienza a usarla hoy mismo.\n"
+    "Solo elige tu documento y ábrelo"
+)
 
 
 def cargar_env(ruta=".env"):
@@ -105,11 +121,8 @@ def normalizar_header(valor):
 
 def validar_columnas(headers):
     columnas_requeridas = [
-        "producto",
-        "numerotarjeta",
-        "nomcompleto",
-        "vig",
-        "etiquetalogistica03",
+        "nombre",
+        "correo",
     ]
 
     faltantes = [col for col in columnas_requeridas if col not in headers]
@@ -117,6 +130,21 @@ def validar_columnas(headers):
         raise ValueError("Faltan columnas en el Excel: " + ", ".join(faltantes))
 
     return headers
+
+
+def construir_nombre_completo(origen, columnas):
+    partes = []
+    for campo in ("nombre", "paterno", "materno"):
+        indice = columnas.get(campo)
+        if indice is None:
+            continue
+
+        if isinstance(origen, (list, tuple)) and indice < len(origen):
+            valor = limpiar_valor(origen[indice])
+            if valor:
+                partes.append(valor)
+
+    return " ".join(partes).strip()
 
 
 def obtener_indice_columnas(ws):
@@ -150,29 +178,28 @@ def leer_destinatarios(ruta):
     ws = wb.active
     columnas = obtener_indice_columnas(ws)
     destinatarios = []
+    descartados_vacios = 0
+    descartados_invalidos = 0
 
     for row in ws.iter_rows(min_row=2, values_only=True):
-        producto = limpiar_valor(row[columnas["producto"]])
-        numero_tarjeta = limpiar_valor(row[columnas["numerotarjeta"]])
-        nombre = limpiar_valor(row[columnas["nomcompleto"]])
-        vigencia = limpiar_valor(row[columnas["vig"]])
-        email = limpiar_valor(row[columnas["etiquetalogistica03"]])
+        nombre = construir_nombre_completo(row, columnas)
+        email = limpiar_valor(row[columnas["correo"]]).lower()
 
-        img_frente = ""
-        if "simgfrente" in columnas and columnas["simgfrente"] < len(row):
-            img_frente = limpiar_valor(row[columnas["simgfrente"]])
+        if not email:
+            descartados_vacios += 1
+            continue
+
+        if "@" not in email:
+            descartados_invalidos += 1
+            continue
 
         if email and "@" in email:
             destinatarios.append({
-                "producto": producto,
-                "numero_tarjeta": numero_tarjeta,
                 "nombre": nombre,
-                "vigencia": vigencia,
                 "email": email,
-                "img_frente": img_frente,
             })
 
-    return destinatarios
+    return destinatarios, descartados_vacios, descartados_invalidos
 
 
 def leer_destinatarios_xls(ruta):
@@ -182,35 +209,39 @@ def leer_destinatarios_xls(ruta):
     sheet = workbook.sheet_by_index(0)
     columnas = obtener_indice_columnas_xls(sheet.row_values(0))
     destinatarios = []
+    descartados_vacios = 0
+    descartados_invalidos = 0
 
     for row_idx in range(1, sheet.nrows):
         row = sheet.row_values(row_idx)
-        producto = limpiar_valor(row[columnas["producto"]])
-        numero_tarjeta = limpiar_valor(row[columnas["numerotarjeta"]])
-        nombre = limpiar_valor(row[columnas["nomcompleto"]])
-        vigencia = limpiar_valor(row[columnas["vig"]])
-        email = limpiar_valor(row[columnas["etiquetalogistica03"]])
+        nombre = construir_nombre_completo(row, columnas)
+        email = limpiar_valor(row[columnas["correo"]]).lower()
 
-        img_frente = ""
-        if "simgfrente" in columnas and columnas["simgfrente"] < len(row):
-            img_frente = limpiar_valor(row[columnas["simgfrente"]])
+        if not email:
+            descartados_vacios += 1
+            continue
+
+        if "@" not in email:
+            descartados_invalidos += 1
+            continue
 
         if email and "@" in email:
             destinatarios.append({
-                "producto": producto,
-                "numero_tarjeta": numero_tarjeta,
                 "nombre": nombre,
-                "vigencia": vigencia,
                 "email": email,
-                "img_frente": img_frente,
             })
 
-    return destinatarios
+    return destinatarios, descartados_vacios, descartados_invalidos
 
 
 def beneficios_html():
     items = "".join(f"<li>{escape(beneficio)}</li>" for beneficio in BENEFICIOS)
-    return f'<ul style="margin:0; padding-left:18px;">{items}</ul>'
+    return (
+        '<ul style="margin:0; padding-left:18px; '
+        "font-family: Verdana, Tahoma, Arial, sans-serif; "
+        'font-size:14px; line-height:1.4;">'
+        f"{items}</ul>"
+    )
 
 
 def imagen_frente_html(valor):
@@ -225,20 +256,14 @@ def imagen_frente_html(valor):
 
 
 def personalizar_html(html_base, persona):
+    nombre = escape(persona.get("nombre", "").strip())
+    saludo = f"<p>{nombre}</p>" if nombre else ""
+    html_personalizado = f"{saludo}{html_base}"
     reemplazos = {
-        "{$nomconcatenado}": escape(persona["nombre"]),
-        "{SimgFrente}": imagen_frente_html(persona["img_frente"]),
-        "{Smembresia}": escape(persona["numero_tarjeta"]),
-        "{SfVencimiento}": escape(persona["vigencia"]),
-        "{SnomProducto}": escape(persona["producto"]),
-        "{$nomBeneficio}": beneficios_html(),
-        "{{NOMBRE}}": escape(persona["nombre"]),
-        "{{EMPLEADO}}": escape(persona["numero_tarjeta"]),
-        "{{VIGENCIA}}": escape(persona["vigencia"]),
-        "{{PRODUCTO}}": escape(persona["producto"]),
+        "{{NOMBRE}}": nombre,
+        "{$nomconcatenado}": nombre,
     }
 
-    html_personalizado = html_base
     for placeholder, valor in reemplazos.items():
         html_personalizado = html_personalizado.replace(placeholder, valor)
 
@@ -309,22 +334,119 @@ def crear_adjunto_imagen(cid, ruta):
     return adjunto
 
 
-def construir_mensaje_raw(asunto, remitente, destinatario, html_personalizado, carpeta_html):
-    html_con_cid, imagenes = embeber_imagenes_html(html_personalizado, carpeta_html)
-
-    mensaje = MIMEMultipart("related")
+def construir_mensaje_raw(
+    asunto,
+    remitente,
+    destinatario,
+    nombre_destinatario,
+    ruta_img_1,
+    ruta_img_2,
+    ruta_img_3,
+    rutas_adjuntos_pdf,
+):
+    mensaje = MIMEMultipart("mixed")
     mensaje["Subject"] = Header(asunto, "utf-8")
     mensaje["From"] = remitente
     mensaje["To"] = destinatario
 
-    alternative = MIMEMultipart("alternative")
-    alternative.attach(MIMEText(html_con_cid, "html", "utf-8"))
-    mensaje.attach(alternative)
+    html_contenido = f"""
+<html>
+  <body style="margin:0; padding:0; background-color:#ffffff;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#ffffff;">
+      <tr>
+        <td align="center" style="padding:20px 12px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="width:600px; max-width:600px; background-color:#ffffff; font-family:Arial, sans-serif; color:#111111;">
+            <tr>
+              <td align="center" style="padding-bottom:18px;">
+                <img src="cid:imagen_1" alt="Imagen 1" style="max-width:100%; height:auto; display:block; border:0;">
+              </td>
+            </tr>
+            <tr>
+              <td style="padding-bottom:10px;">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+                  <tr>
+                    <td valign="top" width="180" style="padding-right:18px;">
+                      <img src="cid:imagen_2" alt="Imagen 2" style="max-width:180px; width:100%; height:auto; display:block; border:0;">
+                    </td>
+                    <td valign="top" style="font-size:16px; line-height:1.35; color:#111111;">
+                      <p style="margin:0 0 14px 0;">Hola 👋</p>
+                      <p style="margin:0;">Nos emociona darte la bienvenida a tu plataforma de reembolso.</p>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="font-size:16px; line-height:1.35; color:#111111; padding:8px 0 10px 0;">
+                <p style="margin:0 0 14px 0;">Aquí podrás consultar tus beneficios, iniciar tus solicitudes y dar seguimiento a cada paso de forma clara, rápida y segura.</p>
+                <p style="margin:0;">✨ Descubre cómo funciona y comienza a usarla hoy mismo.<br>Solo elige tu documento y ábrelo.</p>
+              </td>
+            </tr>
+            <tr>
+              <td align="center" style="padding-top:18px;">
+                <img src="cid:imagen_3" alt="Imagen 3" style="max-width:100%; height:auto; display:block; border:0;">
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+"""
 
-    for cid, ruta in imagenes.items():
-        mensaje.attach(crear_adjunto_imagen(cid, ruta))
+    related = MIMEMultipart("related")
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText(TEXTO_CORREO, "plain", "utf-8"))
+    alternative.attach(MIMEText(html_contenido, "html", "utf-8"))
+    related.attach(alternative)
+    related.attach(crear_adjunto_imagen("imagen_1", ruta_img_1))
+    related.attach(crear_adjunto_imagen("imagen_2", ruta_img_2))
+    related.attach(crear_adjunto_imagen("imagen_3", ruta_img_3))
+    mensaje.attach(related)
+
+    for ruta_adjunto in rutas_adjuntos_pdf:
+        content_type, _ = mimetypes.guess_type(ruta_adjunto)
+        if not content_type:
+            content_type = "application/octet-stream"
+
+        maintype, subtype = content_type.split("/", 1)
+        with open(ruta_adjunto, "rb") as f:
+            adjunto = MIMEBase(maintype, subtype)
+            adjunto.set_payload(f.read())
+
+        encoders.encode_base64(adjunto)
+        adjunto.add_header(
+            "Content-Disposition",
+            "attachment",
+            filename=os.path.basename(ruta_adjunto),
+        )
+        mensaje.attach(adjunto)
 
     return mensaje
+
+
+def validar_tamano_mensaje(asunto, remitente, ruta_img_1, ruta_img_2, ruta_img_3, rutas_adjuntos_pdf):
+    mensaje_prueba = construir_mensaje_raw(
+        asunto,
+        remitente,
+        "destinatario@ejemplo.com",
+        "Destinatario",
+        ruta_img_1,
+        ruta_img_2,
+        ruta_img_3,
+        rutas_adjuntos_pdf,
+    )
+    tamano = len(mensaje_prueba.as_bytes())
+
+    if tamano > SES_MAX_MESSAGE_BYTES:
+        raise ValueError(
+            "El correo con adjuntos excede el limite de AWS SES (10 MB). "
+            f"Tamaño actual: {tamano:,} bytes. "
+            "Reduce la cantidad/tamaño de PDFs y vuelve a intentar."
+        )
+
+    return tamano
 
 
 def crear_cliente_ses():
@@ -432,6 +554,134 @@ def limpiar_log_ui():
     log_text.configure(state=DISABLED)
 
 
+def procesar_cola_envio():
+    global envio_en_proceso
+
+    while True:
+        try:
+            evento = cola_envio.get_nowait()
+        except queue.Empty:
+            break
+
+        tipo = evento.get("tipo")
+
+        if tipo == "log":
+            escribir_log_ui(evento["texto"], evento["tag"])
+        elif tipo == "progress":
+            actualizar_ui(evento["actual"], evento["total"])
+        elif tipo == "error":
+            envio_en_proceso = False
+            btn_enviar.config(state=NORMAL)
+            messagebox.showerror(evento["titulo"], evento["mensaje"])
+        elif tipo == "done":
+            envio_en_proceso = False
+            btn_enviar.config(state=NORMAL)
+            messagebox.showinfo("Proceso terminado", evento["mensaje"])
+
+    if envio_en_proceso:
+        principal.after(100, procesar_cola_envio)
+
+
+def enviar_worker(
+    remitente,
+    asunto,
+    ruta_img_1,
+    ruta_img_2,
+    ruta_img_3,
+    rutas_adjuntos_pdf,
+    destinatarios,
+    descartados_vacios,
+    descartados_invalidos,
+):
+    try:
+        ses = crear_cliente_ses()
+        validar_remitente_ses(ses, remitente)
+    except Exception as e:
+        cola_envio.put({
+            "tipo": "error",
+            "titulo": "AWS SES Error",
+            "mensaje": str(e),
+        })
+        return
+
+    enviados = 0
+    total = len(destinatarios)
+    nombre_log = f"log_envio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+
+    try:
+        with open(nombre_log, "w", encoding="utf-8") as log_file:
+            log_file.write("===== LOG DE ENVIO AWS SES =====\n")
+            log_file.write(f"Fecha: {datetime.now()}\n")
+            log_file.write(f"Remitente: {remitente}\n")
+            log_file.write(f"Total destinatarios: {total}\n\n")
+            log_file.write(f"Descartados por email vacio: {descartados_vacios}\n")
+            log_file.write(f"Descartados por email invalido: {descartados_invalidos}\n\n")
+
+            for i, persona in enumerate(destinatarios, start=1):
+                try:
+                    mensaje = construir_mensaje_raw(
+                        asunto,
+                        remitente,
+                        persona["email"],
+                        persona["nombre"] or "afiliado",
+                        ruta_img_1,
+                        ruta_img_2,
+                        ruta_img_3,
+                        rutas_adjuntos_pdf,
+                    )
+
+                    response = ses.send_raw_email(
+                        Source=remitente,
+                        Destinations=[persona["email"]],
+                        RawMessage={
+                            "Data": mensaje.as_string(),
+                        }
+                    )
+
+                    enviados += 1
+                    message_id = response.get("MessageId", "Sin MessageId")
+                    linea = f"[OK] {persona['email']} - {message_id}"
+                    log_file.write(linea + "\n")
+                    cola_envio.put({"tipo": "log", "texto": linea, "tag": "ok"})
+
+                except Exception as e:
+                    linea = f"[ERROR] {persona['email']} -> {e}"
+                    log_file.write(linea + "\n")
+                    cola_envio.put({"tipo": "log", "texto": linea, "tag": "error"})
+
+                cola_envio.put({"tipo": "progress", "actual": i, "total": total})
+                time.sleep(0.1)
+
+                if i % BLOQUE_TAMANO == 0 and i < total:
+                    mensaje_espera = f"Esperando {ESPERA_ENTRE_BLOQUES} segundos despues de {i} envios..."
+                    log_file.write(f"\n--- {mensaje_espera} ---\n\n")
+                    cola_envio.put({"tipo": "log", "texto": mensaje_espera, "tag": "info"})
+                    time.sleep(ESPERA_ENTRE_BLOQUES)
+
+            log_file.write("\n===== RESUMEN =====\n")
+            log_file.write(f"Enviados correctamente: {enviados}\n")
+            log_file.write(f"No enviados: {total - enviados}\n")
+            log_file.write(f"Descartados por email vacio: {descartados_vacios}\n")
+            log_file.write(f"Descartados por email invalido: {descartados_invalidos}\n")
+
+    except Exception as e:
+        cola_envio.put({
+            "tipo": "error",
+            "titulo": "Error",
+            "mensaje": f"Error durante el envio:\n{e}",
+        })
+        return
+
+    cola_envio.put({
+        "tipo": "done",
+        "mensaje": (
+            f"{enviados} de {total} correos enviados.\n"
+            f"Descartados vacios: {descartados_vacios} | invalidos: {descartados_invalidos}\n"
+            f"Log generado: {nombre_log}"
+        ),
+    })
+
+
 # ========================
 # INTERFAZ
 # ========================
@@ -475,14 +725,46 @@ def seleccionar_excel():
         label_excel.config(text=os.path.basename(ruta_excel))
 
 
-def seleccionar_html():
-    global ruta_html
-    ruta_html = filedialog.askopenfilename(
-        title="Seleccionar HTML",
-        filetypes=[("HTML files", "*.html *.htm")],
+def seleccionar_pdf():
+    global rutas_pdf
+    rutas_pdf = list(filedialog.askopenfilenames(
+        title="Seleccionar PDFs",
+        filetypes=[("PDF", "*.pdf")],
+    ))
+    if rutas_pdf:
+        label_pdf.config(text=f"{len(rutas_pdf)} archivo(s) seleccionado(s)")
+    else:
+        label_pdf.config(text="Ningun archivo seleccionado")
+
+
+def seleccionar_imagen_1():
+    global ruta_imagen_1
+    ruta_imagen_1 = filedialog.askopenfilename(
+        title="Seleccionar Imagen 1",
+        filetypes=[("Imagenes", "*.png *.jpg *.jpeg *.webp")],
     )
-    if ruta_html:
-        label_html.config(text=os.path.basename(ruta_html))
+    if ruta_imagen_1:
+        label_imagen_1.config(text=os.path.basename(ruta_imagen_1))
+
+
+def seleccionar_imagen_2():
+    global ruta_imagen_2
+    ruta_imagen_2 = filedialog.askopenfilename(
+        title="Seleccionar Imagen 2",
+        filetypes=[("Imagenes", "*.png *.jpg *.jpeg *.webp")],
+    )
+    if ruta_imagen_2:
+        label_imagen_2.config(text=os.path.basename(ruta_imagen_2))
+
+
+def seleccionar_imagen_3():
+    global ruta_imagen_3
+    ruta_imagen_3 = filedialog.askopenfilename(
+        title="Seleccionar Imagen 3",
+        filetypes=[("Imagenes", "*.png *.jpg *.jpeg *.webp")],
+    )
+    if ruta_imagen_3:
+        label_imagen_3.config(text=os.path.basename(ruta_imagen_3))
 
 
 # ========================
@@ -490,7 +772,11 @@ def seleccionar_html():
 # ========================
 
 def enviar():
-    global ruta_excel, ruta_html
+    global ruta_excel, ruta_imagen_1, ruta_imagen_2, ruta_imagen_3, rutas_pdf, envio_en_proceso
+
+    if envio_en_proceso:
+        messagebox.showinfo("Envio en proceso", "Ya hay un envio en curso. Espera a que termine.")
+        return
 
     remitente = remitente_var.get().strip()
     asunto = asunto_var.get().strip()
@@ -503,97 +789,59 @@ def enviar():
         messagebox.showerror("Error", "Escribe el asunto del correo")
         return
 
-    if not ruta_excel or not ruta_html:
-        messagebox.showerror("Error", "Selecciona Excel y HTML")
+    if not ruta_excel or not ruta_imagen_1 or not ruta_imagen_2 or not ruta_imagen_3:
+        messagebox.showerror("Error", "Selecciona Excel e Imagen 1, Imagen 2 e Imagen 3")
         return
 
-    carpeta_html = os.path.dirname(ruta_html)
-
     try:
-        with open(ruta_html, "r", encoding="utf-8") as f:
-            html_base = f.read()
+        validar_tamano_mensaje(
+            asunto,
+            remitente,
+            ruta_imagen_1,
+            ruta_imagen_2,
+            ruta_imagen_3,
+            rutas_pdf,
+        )
     except Exception as e:
-        messagebox.showerror("Error", f"No se pudo leer el HTML:\n{e}")
+        messagebox.showerror("Error", str(e))
         return
 
     try:
-        destinatarios = leer_destinatarios(ruta_excel)
+        destinatarios, descartados_vacios, descartados_invalidos = leer_destinatarios(ruta_excel)
     except Exception as e:
         messagebox.showerror("Error", f"Excel invalido:\n{e}")
         return
 
     if not destinatarios:
-        messagebox.showerror("Error", "No se encontraron correos en EtiquetaLogistica03")
+        messagebox.showerror("Error", "No se encontraron correos en la columna correo")
         return
 
-    try:
-        ses = crear_cliente_ses()
-        validar_remitente_ses(ses, remitente)
-    except Exception as e:
-        messagebox.showerror("AWS SES Error", str(e))
-        return
-
-    enviados = 0
     total = len(destinatarios)
 
     progress["maximum"] = total
     progress["value"] = 0
     actualizar_ui(0, total)
     limpiar_log_ui()
+    envio_en_proceso = True
+    btn_enviar.config(state=DISABLED)
 
-    nombre_log = f"log_envio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-
-    with open(nombre_log, "w", encoding="utf-8") as log_file:
-        log_file.write("===== LOG DE ENVIO AWS SES =====\n")
-        log_file.write(f"Fecha: {datetime.now()}\n")
-        log_file.write(f"Remitente: {remitente}\n")
-        log_file.write(f"Total destinatarios: {total}\n\n")
-
-        for i, persona in enumerate(destinatarios, start=1):
-            try:
-                html_personalizado = personalizar_html(html_base, persona)
-                mensaje = construir_mensaje_raw(
-                    asunto,
-                    remitente,
-                    persona["email"],
-                    html_personalizado,
-                    carpeta_html,
-                )
-
-                response = ses.send_raw_email(
-                    Source=remitente,
-                    Destinations=[persona["email"]],
-                    RawMessage={
-                        "Data": mensaje.as_string(),
-                    }
-                )
-
-                enviados += 1
-                message_id = response.get("MessageId", "Sin MessageId")
-                log_file.write(f"[OK] {persona['email']} - {message_id}\n")
-                escribir_log_ui(f"[OK] {persona['email']} - {message_id}", "ok")
-
-            except Exception as e:
-                log_file.write(f"[ERROR] {persona['email']} -> {e}\n")
-                escribir_log_ui(f"[ERROR] {persona['email']} -> {e}", "error")
-
-            actualizar_ui(i, total)
-            time.sleep(0.1)
-
-            if i % BLOQUE_TAMANO == 0 and i < total:
-                mensaje_espera = f"Esperando {ESPERA_ENTRE_BLOQUES} segundos despues de {i} envios..."
-                log_file.write(f"\n--- {mensaje_espera} ---\n\n")
-                escribir_log_ui(mensaje_espera, "info")
-                time.sleep(ESPERA_ENTRE_BLOQUES)
-
-        log_file.write("\n===== RESUMEN =====\n")
-        log_file.write(f"Enviados correctamente: {enviados}\n")
-        log_file.write(f"No enviados: {total - enviados}\n")
-
-    messagebox.showinfo(
-        "Proceso terminado",
-        f"{enviados} de {total} correos enviados.\nLog generado: {nombre_log}",
+    worker = threading.Thread(
+        target=enviar_worker,
+        args=(
+            remitente,
+            asunto,
+            ruta_imagen_1,
+            ruta_imagen_2,
+            ruta_imagen_3,
+            rutas_pdf,
+            destinatarios,
+            descartados_vacios,
+            descartados_invalidos,
+        ),
+        daemon=True,
     )
+    worker.start()
+    principal.after(100, procesar_cola_envio)
 
 
 # ========================
@@ -605,37 +853,53 @@ Button(principal, text="Seleccionar Excel", command=seleccionar_excel).grid(row=
 label_excel = Label(principal, text="Ningun archivo seleccionado", bg="black", fg="white", anchor="w")
 label_excel.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
 
-Button(principal, text="Seleccionar HTML", command=seleccionar_html).grid(row=3, column=0, padx=10, pady=5, sticky="ew")
+Button(principal, text="Seleccionar Imagen 1", command=seleccionar_imagen_1).grid(row=3, column=0, padx=10, pady=5, sticky="ew")
 
-label_html = Label(principal, text="Ningun archivo seleccionado", bg="black", fg="white", anchor="w")
-label_html.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
+label_imagen_1 = Label(principal, text="Ningun archivo seleccionado", bg="black", fg="white", anchor="w")
+label_imagen_1.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
+
+Button(principal, text="Seleccionar Imagen 2", command=seleccionar_imagen_2).grid(row=4, column=0, padx=10, pady=5, sticky="ew")
+
+label_imagen_2 = Label(principal, text="Ningun archivo seleccionado", bg="black", fg="white", anchor="w")
+label_imagen_2.grid(row=4, column=1, padx=5, pady=5, sticky="ew")
+
+Button(principal, text="Seleccionar Imagen 3", command=seleccionar_imagen_3).grid(row=5, column=0, padx=10, pady=5, sticky="ew")
+
+label_imagen_3 = Label(principal, text="Ningun archivo seleccionado", bg="black", fg="white", anchor="w")
+label_imagen_3.grid(row=5, column=1, padx=5, pady=5, sticky="ew")
+
+Button(principal, text="Seleccionar PDFs (Opcional)", command=seleccionar_pdf).grid(row=6, column=0, padx=10, pady=5, sticky="ew")
+
+label_pdf = Label(principal, text="Ningun archivo seleccionado", bg="black", fg="white", anchor="w")
+label_pdf.grid(row=6, column=1, padx=5, pady=5, sticky="ew")
 
 progress = ttk.Progressbar(principal, orient="horizontal", length=500, mode="determinate")
-progress.grid(row=4, column=1, padx=5, pady=15, sticky="ew")
+progress.grid(row=7, column=1, padx=5, pady=15, sticky="ew")
 
 label_contador = Label(principal, text="0 / 0 correos", bg="black", fg="white")
-label_contador.grid(row=5, column=1, padx=5, sticky="w")
+label_contador.grid(row=8, column=1, padx=5, sticky="w")
 
 label_porcentaje = Label(principal, text="0%", bg="black", fg="white")
-label_porcentaje.grid(row=5, column=1, padx=5, sticky="e")
+label_porcentaje.grid(row=8, column=1, padx=5, sticky="e")
 
-Button(
+btn_enviar = Button(
     principal,
     text="Enviar Correos",
     command=enviar,
     bg="#215cc1",
     fg="white",
     width=30,
-).grid(row=6, column=1, padx=5, pady=10)
+)
+btn_enviar.grid(row=9, column=1, padx=5, pady=10)
 
-Label(principal, text="Log en tiempo real:", bg="black", fg="white").grid(row=7, column=0, padx=10, pady=5, sticky="ne")
+Label(principal, text="Log en tiempo real:", bg="black", fg="white").grid(row=10, column=0, padx=10, pady=5, sticky="ne")
 
 log_text = ScrolledText(principal, height=14, width=80, state=DISABLED, bg="#111111", fg="white")
-log_text.grid(row=7, column=1, padx=5, pady=5, sticky="nsew")
+log_text.grid(row=10, column=1, padx=5, pady=5, sticky="nsew")
 log_text.tag_configure("ok", foreground="#33cc66")
 log_text.tag_configure("error", foreground="#ff5555")
 log_text.tag_configure("info", foreground="#d7d7d7")
 
-principal.grid_rowconfigure(7, weight=1)
+principal.grid_rowconfigure(10, weight=1)
 
 principal.mainloop()
