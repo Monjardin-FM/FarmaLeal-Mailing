@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 
 import boto3
 
@@ -59,6 +60,7 @@ ruta_html = ""
 
 
 def cargar_env(ruta=".env"):
+    # Busca el .env tanto en la carpeta actual como junto al script.
     rutas = [
         os.path.join(os.getcwd(), ruta),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), ruta),
@@ -89,6 +91,7 @@ SES_SOURCE_EMAIL = os.getenv("SES_SOURCE_EMAIL", "")
 
 
 def limpiar_valor(valor):
+    # Convierte valores de Excel a texto limpio y consistente.
     if valor is None:
         return ""
 
@@ -100,26 +103,35 @@ def limpiar_valor(valor):
 
 
 def normalizar_header(valor):
-    return limpiar_valor(valor).lower().replace(" ", "")
+    # Facilita comparar encabezados aunque cambien acentos, espacios o mayusculas.
+    texto = limpiar_valor(valor).lower().replace(" ", "")
+    texto = unicodedata.normalize("NFKD", texto)
+    return "".join(c for c in texto if not unicodedata.combining(c))
+
+
+def resolver_columna(headers, *aliases):
+    # Permite aceptar varios nombres posibles para una misma columna.
+    for alias in aliases:
+        if alias in headers:
+            return headers[alias]
+
+    raise ValueError(f"Falta una columna en el Excel. Se esperaba alguna de: {', '.join(aliases)}")
 
 
 def validar_columnas(headers):
-    columnas_requeridas = [
-        "producto",
-        "numerotarjeta",
-        "nomcompleto",
-        "vig",
-        "etiquetalogistica03",
-    ]
-
-    faltantes = [col for col in columnas_requeridas if col not in headers]
-    if faltantes:
-        raise ValueError("Faltan columnas en el Excel: " + ", ".join(faltantes))
-
-    return headers
+    # Traduce nombres reales del Excel a las claves internas del programa.
+    return {
+        "producto": resolver_columna(headers, "producto"),
+        "numerotarjeta": resolver_columna(headers, "numerotarjeta", "numerodetarjeta"),
+        "nomcompleto": resolver_columna(headers, "nomcompleto", "nombrecompleto"),
+        "vig": resolver_columna(headers, "vig", "vigencia"),
+        "etiquetalogistica03": resolver_columna(headers, "etiquetalogistica03", "correo"),
+        "simgfrente": headers.get("simgfrente"),
+    }
 
 
 def obtener_indice_columnas(ws):
+    # Lee la primera fila del .xlsx y genera el mapa encabezado -> indice.
     headers = {}
 
     for i, celda in enumerate(ws[1], start=0):
@@ -131,6 +143,7 @@ def obtener_indice_columnas(ws):
 
 
 def obtener_indice_columnas_xls(header_row):
+    # Hace el mismo mapeo de encabezados para archivos .xls.
     headers = {}
 
     for i, valor in enumerate(header_row):
@@ -142,6 +155,7 @@ def obtener_indice_columnas_xls(header_row):
 
 
 def leer_destinatarios(ruta):
+    # Carga destinatarios desde Excel y los normaliza a un formato unico.
     extension = os.path.splitext(ruta)[1].lower()
     if extension == ".xls":
         return leer_destinatarios_xls(ruta)
@@ -152,6 +166,7 @@ def leer_destinatarios(ruta):
     destinatarios = []
 
     for row in ws.iter_rows(min_row=2, values_only=True):
+        # Cada fila se convierte a un diccionario que luego usa la plantilla.
         producto = limpiar_valor(row[columnas["producto"]])
         numero_tarjeta = limpiar_valor(row[columnas["numerotarjeta"]])
         nombre = limpiar_valor(row[columnas["nomcompleto"]])
@@ -159,9 +174,10 @@ def leer_destinatarios(ruta):
         email = limpiar_valor(row[columnas["etiquetalogistica03"]])
 
         img_frente = ""
-        if "simgfrente" in columnas and columnas["simgfrente"] < len(row):
+        if columnas.get("simgfrente") is not None and columnas["simgfrente"] < len(row):
             img_frente = limpiar_valor(row[columnas["simgfrente"]])
 
+        # Solo se procesan filas con una direccion de correo utilizable.
         if email and "@" in email:
             destinatarios.append({
                 "producto": producto,
@@ -176,6 +192,7 @@ def leer_destinatarios(ruta):
 
 
 def leer_destinatarios_xls(ruta):
+    # Mantiene soporte para .xls con la misma salida que la lectura de .xlsx.
     import xlrd
 
     workbook = xlrd.open_workbook(ruta)
@@ -185,6 +202,7 @@ def leer_destinatarios_xls(ruta):
 
     for row_idx in range(1, sheet.nrows):
         row = sheet.row_values(row_idx)
+        # Se replica el mismo formato interno de destinatario.
         producto = limpiar_valor(row[columnas["producto"]])
         numero_tarjeta = limpiar_valor(row[columnas["numerotarjeta"]])
         nombre = limpiar_valor(row[columnas["nomcompleto"]])
@@ -192,7 +210,7 @@ def leer_destinatarios_xls(ruta):
         email = limpiar_valor(row[columnas["etiquetalogistica03"]])
 
         img_frente = ""
-        if "simgfrente" in columnas and columnas["simgfrente"] < len(row):
+        if columnas.get("simgfrente") is not None and columnas["simgfrente"] < len(row):
             img_frente = limpiar_valor(row[columnas["simgfrente"]])
 
         if email and "@" in email:
@@ -209,11 +227,13 @@ def leer_destinatarios_xls(ruta):
 
 
 def beneficios_html():
+    # Inserta la lista fija de beneficios como HTML.
     items = "".join(f"<li>{escape(beneficio)}</li>" for beneficio in BENEFICIOS)
     return f'<ul style="margin:0; padding-left:18px;">{items}</ul>'
 
 
 def imagen_frente_html(valor):
+    # Si ya viene HTML lo respeta; si no, arma una etiqueta <img>.
     valor = limpiar_valor(valor)
     if not valor:
         return ""
@@ -225,13 +245,18 @@ def imagen_frente_html(valor):
 
 
 def personalizar_html(html_base, persona):
+    # Reemplaza placeholders de la plantilla con los datos de cada persona.
     reemplazos = {
         "{$nomconcatenado}": escape(persona["nombre"]),
+        "{$imgFrente}": imagen_frente_html(persona["img_frente"]),
+        "{$membresia}": escape(persona["numero_tarjeta"]),
+        "{$fVencimiento}": escape(persona["vigencia"]),
+        "{$nomProducto}": escape(persona["producto"]),
+        "{$nomBeneficio}": beneficios_html(),
         "{SimgFrente}": imagen_frente_html(persona["img_frente"]),
         "{Smembresia}": escape(persona["numero_tarjeta"]),
         "{SfVencimiento}": escape(persona["vigencia"]),
         "{SnomProducto}": escape(persona["producto"]),
-        "{$nomBeneficio}": beneficios_html(),
         "{{NOMBRE}}": escape(persona["nombre"]),
         "{{EMPLEADO}}": escape(persona["numero_tarjeta"]),
         "{{VIGENCIA}}": escape(persona["vigencia"]),
@@ -246,12 +271,14 @@ def personalizar_html(html_base, persona):
 
 
 def es_recurso_externo(src):
+    # Evita intentar embeber URLs o esquemas que no son archivos locales.
     src = src.strip()
     esquema = urlparse(src).scheme.lower()
     return esquema in ("http", "https", "cid", "data", "mailto", "tel")
 
 
 def ruta_imagen_local(carpeta_html, src):
+    # Resuelve una imagen relativa al HTML y bloquea rutas fuera de esa carpeta.
     src_limpio = unquote(src.split("#", 1)[0].split("?", 1)[0]).replace("/", os.sep)
     ruta = os.path.abspath(os.path.join(carpeta_html, src_limpio))
     carpeta_base = os.path.abspath(carpeta_html)
@@ -266,6 +293,7 @@ def ruta_imagen_local(carpeta_html, src):
 
 
 def embeber_imagenes_html(html, carpeta_html):
+    # Convierte imagenes locales a cids para enviarlas embebidas por correo.
     imagenes = {}
 
     def reemplazar_src(match):
@@ -292,6 +320,7 @@ def embeber_imagenes_html(html, carpeta_html):
 
 
 def crear_adjunto_imagen(cid, ruta):
+    # Prepara una imagen inline con el Content-ID que usa el HTML.
     content_type, _ = mimetypes.guess_type(ruta)
     if not content_type:
         content_type = "application/octet-stream"
@@ -310,6 +339,7 @@ def crear_adjunto_imagen(cid, ruta):
 
 
 def construir_mensaje_raw(asunto, remitente, destinatario, html_personalizado, carpeta_html):
+    # Arma el mensaje MIME final con HTML e imagenes embebidas.
     html_con_cid, imagenes = embeber_imagenes_html(html_personalizado, carpeta_html)
 
     mensaje = MIMEMultipart("related")
@@ -328,6 +358,7 @@ def construir_mensaje_raw(asunto, remitente, destinatario, html_personalizado, c
 
 
 def crear_cliente_ses():
+    # Valida configuracion minima y crea el cliente de AWS SES.
     faltantes = [
         nombre
         for nombre, valor in {
@@ -350,6 +381,7 @@ def crear_cliente_ses():
 
 
 def dominio_de_correo(correo):
+    # Extrae el dominio del remitente para validar dominios verificados en SES.
     if "@" not in correo:
         return ""
 
@@ -357,6 +389,7 @@ def dominio_de_correo(correo):
 
 
 def obtener_identidades_verificadas(ses):
+    # Recupera correos y dominios verificados para validar el remitente antes de enviar.
     identidades = []
 
     for tipo in ("EmailAddress", "Domain"):
@@ -378,6 +411,7 @@ def obtener_identidades_verificadas(ses):
 
     verificadas = []
     for inicio in range(0, len(identidades), 100):
+        # SES consulta atributos por bloques de hasta 100 identidades.
         bloque = identidades[inicio:inicio + 100]
         atributos = ses.get_identity_verification_attributes(
             Identities=bloque
@@ -392,6 +426,7 @@ def obtener_identidades_verificadas(ses):
 
 
 def validar_remitente_ses(ses, remitente):
+    # El remitente es valido si el correo o su dominio estan verificados en SES.
     correo = remitente.strip().lower()
     dominio = dominio_de_correo(correo)
     verificadas = obtener_identidades_verificadas(ses)
@@ -411,6 +446,7 @@ def validar_remitente_ses(ses, remitente):
 
 
 def escribir_log_ui(texto, tag):
+    # Agrega una linea al log visual y mantiene visible el ultimo mensaje.
     log_text.configure(state=NORMAL)
     log_text.insert(END, texto + "\n", tag)
     log_text.see(END)
@@ -419,6 +455,7 @@ def escribir_log_ui(texto, tag):
 
 
 def actualizar_ui(actual, total):
+    # Sincroniza barra, contador y porcentaje durante el envio.
     progress["value"] = actual
     porcentaje = int((actual / total) * 100) if total else 0
     label_contador.config(text=f"{actual} / {total} correos")
@@ -427,6 +464,7 @@ def actualizar_ui(actual, total):
 
 
 def limpiar_log_ui():
+    # Reinicia el area de log antes de comenzar un nuevo proceso.
     log_text.configure(state=NORMAL)
     log_text.delete("1.0", END)
     log_text.configure(state=DISABLED)
@@ -466,6 +504,7 @@ Entry(principal, textvariable=asunto_var, width=70).grid(row=1, column=1, padx=5
 # ========================
 
 def seleccionar_excel():
+    # Permite elegir el Excel con los destinatarios.
     global ruta_excel
     ruta_excel = filedialog.askopenfilename(
         title="Seleccionar Excel",
@@ -476,6 +515,7 @@ def seleccionar_excel():
 
 
 def seleccionar_html():
+    # Permite elegir la plantilla HTML del correo.
     global ruta_html
     ruta_html = filedialog.askopenfilename(
         title="Seleccionar HTML",
@@ -490,6 +530,7 @@ def seleccionar_html():
 # ========================
 
 def enviar():
+    # Coordina validaciones, lectura del Excel, personalizacion y envio de correos.
     global ruta_excel, ruta_html
 
     remitente = remitente_var.get().strip()
@@ -522,6 +563,7 @@ def enviar():
         messagebox.showerror("Error", f"Excel invalido:\n{e}")
         return
 
+    # Si no hay correos validos, no vale la pena continuar con SES.
     if not destinatarios:
         messagebox.showerror("Error", "No se encontraron correos en EtiquetaLogistica03")
         return
@@ -551,6 +593,7 @@ def enviar():
 
         for i, persona in enumerate(destinatarios, start=1):
             try:
+                # Cada correo se construye de forma individual para personalizar su contenido.
                 html_personalizado = personalizar_html(html_base, persona)
                 mensaje = construir_mensaje_raw(
                     asunto,
@@ -580,6 +623,7 @@ def enviar():
             actualizar_ui(i, total)
             time.sleep(0.1)
 
+            # Pausa entre bloques para evitar rafagas continuas de envios.
             if i % BLOQUE_TAMANO == 0 and i < total:
                 mensaje_espera = f"Esperando {ESPERA_ENTRE_BLOQUES} segundos despues de {i} envios..."
                 log_file.write(f"\n--- {mensaje_espera} ---\n\n")
