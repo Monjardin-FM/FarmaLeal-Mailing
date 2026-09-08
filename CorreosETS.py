@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from email import encoders
 from email.header import Header
 from email.mime.base import MIMEBase
@@ -51,6 +51,21 @@ BENEFICIOS = [
     "VIDEOCONSULTAS ILIMITADAS CON MEDICINA GENERAL, NUTRICION Y PSICOLOGIA CON MEDICOS DEL CENTRO DE CONTACTO DE SALUD DIGITAL.",
 ]
 
+MESES_ABREVIADOS = {
+    1: "ene",
+    2: "feb",
+    3: "mar",
+    4: "abr",
+    5: "may",
+    6: "jun",
+    7: "jul",
+    8: "ago",
+    9: "sep",
+    10: "oct",
+    11: "nov",
+    12: "dic",
+}
+
 # ========================
 # VARIABLES GLOBALES
 # ========================
@@ -100,6 +115,32 @@ def limpiar_valor(valor):
         texto = texto[1:].strip()
 
     return texto
+
+
+def limpiar_fecha(valor):
+    # La vigencia debe mostrarse como fecha, sin hora.
+    if valor is None:
+        return ""
+
+    if isinstance(valor, datetime):
+        return formatear_fecha(valor.date())
+
+    if isinstance(valor, date):
+        return formatear_fecha(valor)
+
+    texto = limpiar_valor(valor)
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})(?:\s+00:00:00(?:\.0)?)?$", texto)
+    if match:
+        try:
+            return formatear_fecha(datetime.strptime(match.group(1), "%Y-%m-%d").date())
+        except ValueError:
+            return texto
+
+    return texto
+
+
+def formatear_fecha(fecha):
+    return f"{fecha.day:02d}/{MESES_ABREVIADOS[fecha.month]}/{fecha.year}"
 
 
 def normalizar_header(valor):
@@ -170,7 +211,7 @@ def leer_destinatarios(ruta):
         producto = limpiar_valor(row[columnas["producto"]])
         numero_tarjeta = limpiar_valor(row[columnas["numerotarjeta"]])
         nombre = limpiar_valor(row[columnas["nomcompleto"]])
-        vigencia = limpiar_valor(row[columnas["vig"]])
+        vigencia = limpiar_fecha(row[columnas["vig"]])
         email = limpiar_valor(row[columnas["etiquetalogistica03"]])
 
         img_frente = ""
@@ -206,7 +247,7 @@ def leer_destinatarios_xls(ruta):
         producto = limpiar_valor(row[columnas["producto"]])
         numero_tarjeta = limpiar_valor(row[columnas["numerotarjeta"]])
         nombre = limpiar_valor(row[columnas["nomcompleto"]])
-        vigencia = limpiar_valor(row[columnas["vig"]])
+        vigencia = limpiar_fecha(row[columnas["vig"]])
         email = limpiar_valor(row[columnas["etiquetalogistica03"]])
 
         img_frente = ""
